@@ -1,19 +1,13 @@
-import streamlit as st
 import csv
-import os
-import json
-import requests
 import pandas as pd
-import faiss
-import numpy as np
+import chromadb
+from chromadb.utils import embedding_functions
+import os
 from openai import OpenAI
 
-# File names for persistence
-INDEX_FILE = "space_index.faiss"
-DOCS_FILE = "space_docs.json"
 
-# --------------------- Embedding Function ---------------------
-# Handles text embedding via Ollama API
+import requests
+
 class OllamaEmbeddingFunction:
     def __init__(self, base_url="http://localhost:11434/api/embeddings", model="nomic-embed-text"):
         self.base_url = base_url
@@ -25,33 +19,49 @@ class OllamaEmbeddingFunction:
 
         embeddings = []
         for text in input:
-            payload = {"model": self.model, "prompt": text}
+            payload = {
+                "model": self.model,
+                "prompt": text,
+            }
             try:
-                response = requests.post(self.base_url, json=payload)
+                response = requests.post(f"{self.base_url}", json=payload)
                 response.raise_for_status()
                 data = response.json()
                 embeddings.append(data["embedding"])
             except Exception as e:
                 print(f"Embedding error for text: '{text[:30]}...': {e}")
-                embeddings.append([0.0] * 768)  # Fallback vector in case of error
+                embeddings.append([0.0] * 768)  # or whatever your fallback size is
         return embeddings
 
-# --------------------- Embedding Model Wrapper ---------------------
-# Selects and initializes the embedding method based on user input
+
+
+# Using 'nomic-embed-text' model for Ollama
+# API key for OpenAI - paid
+api_key = ""
+
 class EmbeddingModel:
     def __init__(self, model_type="openai"):
+        self.model_type = model_type
         if model_type == "openai":
-            self.client = OpenAI(api_key="")
-            self.embedding_fn = lambda texts: embedding_functions.OpenAIEmbeddingFunction(api_key="", model_name="text-embedding-3-small")(texts)
+            self.client = OpenAI(api_key)
+            self.embedding_fn = embedding_functions.OpenAIEmbeddingFunction(
+                api_key,
+                model_name = "text-embedding-3-small"
+            )
         elif model_type == "chroma":
             self.embedding_fn = embedding_functions.DefaultEmbeddingFunction()
         elif model_type == "nomic":
+            # using Ollama nomic-embed-text model
+            # self.embedding_fn = embedding_functions.OpenAIEmbeddingFunction(
+            #     api_key="ollama",
+            #     api_base="http://localhost:11434/v1",
+            #     model_name="nomic-embed-text"
+            # )
             self.embedding_fn = OllamaEmbeddingFunction()
 
-# --------------------- LLM Wrapper ---------------------
-# Selects and initializes the LLM model for chat completions
 class LLMModel:
-    def __init__(self, model_type="openai"):
+    def __init__(self, model_type = "openai"):
+        self.model_type = model_type
         if model_type == "openai":
             self.client = OpenAI(api_key="")
             self.model_name = "gpt-4o-mini"
@@ -62,17 +72,42 @@ class LLMModel:
     def generate_completion(self, messages):
         try:
             response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=0.0,
+                model = self.model_name,
+                messages = messages,
+                temperature = 0.0, # 0.0 is deterministic
             )
             return response.choices[0].message.content
         except Exception as e:
             return f"Error generating response: {str(e)}"
+        
+def select_models():
+    # Select LLM Model
+    print("\nSelect LLM Model:")
+    print("1. OpenAI GPT-4")
+    print("2. Ollama llama2")
 
-# --------------------- CSV Utilities ---------------------
-# Generates a CSV file containing factual data for testing retrieval
-# This serves as the source of knowledge for RAG
+    while True:
+        choice = input("Enter choice (1 or 2): ").strip()
+        if choice in ["1", "2"]:
+            llm_type = "openai" if choice == "1" else "ollama"
+            break
+        print("Please enter either 1 or 2")
+
+    # Select Embedding Model
+    print("\nSelect Embedding Model: ")
+    print("1. OpenAI Embeddings")
+    print("2. Chroma Default")
+    print("3. Nomic Embed Text (Ollama)")
+
+    while True:
+        choice  = input("Enter choice (1, 2 or 3): ").strip()
+        if(choice in ["1", "2", "3"]):
+            embedding_type = {"1": "openai", "2": "chroma", "3":"nomic"}[choice]
+            break
+        print("Please enter 1, 2 or 3")
+
+    return llm_type, embedding_type
+
 
 def generate_csv():
     facts = [
@@ -97,130 +132,164 @@ def generate_csv():
         {"id": 19, "fact": "A spoonful of a white dwarf star would weigh as much as an elephant."},
         {"id": 20, "fact": "It takes sunlight about 8 minutes and 20 seconds to reach Earth."}
     ]
+
+
     with open("space_facts.csv", mode="w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=["id", "fact"])
         writer.writeheader()
         writer.writerows(facts)
-    print("CSV file 'space_facts.csv' created successfully!")
 
-# Loads the CSV data into a list of documents
+    print("CSV file 'space_facts.csv' created successfully!")
 
 def load_csv():
     df = pd.read_csv("space_facts.csv", encoding='ISO-8859-1')
+
     documents = df["fact"].tolist()
     print("\nLoaded documents: ")
     for doc in documents:
         print(f"- {doc}")
     return documents
 
-# --------------------- FAISS Setup ---------------------
-# Builds or loads a FAISS index and its associated documents from disk
-# If no saved index exists, computes new embeddings and saves them
+# def setup_chromadb(documents, embedding_model):
+#     from chromadb import PersistentClient
 
-def setup_faiss(documents, embedding_model):
-    if os.path.exists(INDEX_FILE) and os.path.exists(DOCS_FILE):
-        print("\nLoading existing FAISS index and documents...")
-        index = faiss.read_index(INDEX_FILE)
-        with open(DOCS_FILE, "r", encoding="utf-8") as f:
-            documents = json.load(f)
-    else:
-        print("\nGenerating new FAISS index...")
-        embeddings = embedding_model.embedding_fn(documents)
-        dim = len(embeddings[0])
-        index = faiss.IndexFlatL2(dim)
-        index.add(np.array(embeddings).astype("float32"))
-        faiss.write_index(index, INDEX_FILE)
-        with open(DOCS_FILE, "w", encoding="utf-8") as f:
-            json.dump(documents, f)
-    print("\nFAISS index ready!")
-    return index, documents
+#     client = PersistentClient(path="chroma_store")
+#     # client = chromadb.Client()
+#     try:
+#         client.delete_collection("space_facts")
+#     except Exception as e:
+#         print("Exception occured: ", e)
+        
 
-# --------------------- Query Utilities ---------------------
-# Retrieves the top-k most similar documents to the query using FAISS
+#     collection = client.create_collection(
+#         name="space_facts",
+#         embedding_function= embedding_model.embedding_fn
+#     )
 
-def find_related_chunks(query, faiss_index, documents, embedding_model, top_k=2):
-    query_embedding = embedding_model.embedding_fn(query)
-    D, I = faiss_index.search(np.array(query_embedding).astype("float32"), top_k)
+#     collection.add(documents=documents, ids=[str(i) for i in range(len(documents))])
+
+#     print("\nDocuments added to ChromaDB collection successfully!")
+#     return collection
+
+
+def setup_chromadb(documents, embedding_model):
+    from chromadb import PersistentClient
+
+    client = PersistentClient(path="chroma_store")
+
+    # Get all existing collections and check if "space_facts" exists
+    existing_collections = [col.name for col in client.list_collections()]
+    if "space_facts" in existing_collections:
+        print("Collection already exists. Deleting it first.")
+        client.delete_collection("space_facts")
+
+    # Now re-create it
+    collection = client.create_collection(
+        name="space_facts",
+        embedding_function=embedding_model.embedding_fn
+    )
+
+    collection.add(
+        documents=documents,
+        ids=[str(i) for i in range(len(documents))],
+        metadatas=[{"index": i} for i in range(len(documents))]
+    )
+
+    print("\nDocuments added to ChromaDB collection successfully!")
+    return collection
+
+
+def find_related_chunks(query, collection, top_k=2):
+    results = collection.query(query_texts=[query], n_results=top_k)
+
     print("\nRelated chunks found:")
-    return [(documents[i], {"score": D[0][k]}) for k, i in enumerate(I[0])]
+    for doc in results["documents"][0]:
+        print(f"- {doc}")
 
-# Constructs an augmented prompt for the LLM using retrieved chunks
+    return list(
+        zip(
+            results["documents"][0],
+            (
+                results["metadatas"][0]
+                if results["metadatas"][0]
+                else [{}] * len(results["documents"][0])
+            ),
+        )
+    )
 
 def augment_prompt(query, related_chunks):
     context = "\n".join([chunk[0] for chunk in related_chunks])
     augmented_prompt = f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"
+
     print("\nAugmented prompt: ")
     print(augmented_prompt)
+
     return augmented_prompt
 
-# Executes the full Retrieval-Augmented Generation pipeline
-# 1. Retrieves relevant docs
-# 2. Augments prompt with context
-# 3. Generates answer using the LLM
-
-def rag_pipeline(query, faiss_index, documents, llm_model, embedding_model, top_k=2):
+def rag_pipeline(query, collection, llm_model, top_k=2):
     print(f"\nProcessing query: {query}")
-    related_chunks = find_related_chunks(query, faiss_index, documents, embedding_model, top_k)
+
+    related_chunks = find_related_chunks(query, collection, top_k)
     augmented_prompt = augment_prompt(query, related_chunks)
-    response = llm_model.generate_completion([
-        {"role": "system", "content": "You are a helpful assistant who only answers based on the context."},
-        {"role": "user", "content": augmented_prompt}
-    ])
+
+    response = llm_model.generate_completion(
+        [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant who can answer questions about space but only answers questions that are directly related to the sources/documents given."
+            },
+            {
+                "role": "user",
+                "content": augmented_prompt
+            }
+        ]
+    )
+
     print("\nGenerated response: ")
     print(response)
+
     references = [chunk[0] for chunk in related_chunks]
     return response, references
 
-# --------------------- Main ---------------------
-# Prompts user to choose LLM and embedding models
-
-def select_models():
-    print("\nSelect LLM Model:")
-    print("1. OpenAI GPT-4")
-    print("2. Ollama llama3.2")
-    while True:
-        choice = input("Enter choice (1 or 2): ").strip()
-        if choice in ["1", "2"]:
-            llm_type = "openai" if choice == "1" else "ollama"
-            break
-    print("\nSelect Embedding Model:")
-    print("1. OpenAI Embeddings")
-    print("2. Chroma Default")
-    print("3. Nomic Embed Text (Ollama)")
-    while True:
-        choice = input("Enter choice (1, 2 or 3): ").strip()
-        if choice in ["1", "2", "3"]:
-            embedding_type = {"1": "openai", "2": "chroma", "3": "nomic"}[choice]
-            break
-    return llm_type, embedding_type
-
-# Main function to coordinate entire RAG demo flow
-
 def main():
     print("Starting the RAG pipeline demo...")
+
+    # Select models
     llm_type, embedding_type = select_models()
+
+    # Initialize models
     llm_model = LLMModel(llm_type)
     embedding_model = EmbeddingModel(embedding_type)
+
     print(f"\nUsing LLM: {llm_type.upper()}")
     print(f"Using Embeddings: {embedding_type.upper()}")
+
+    # Generate and load data
     generate_csv()
     documents = load_csv()
-    faiss_index, documents = setup_faiss(documents, embedding_model)
+
+    # Setup ChromaDB
+    collection = setup_chromadb(documents, embedding_model)
+
+    # Run queries
     queries = [
         "What is relation between a day and a year on Venus?",
         "For how many years will the footprints remain on moon?"
     ]
+
     for query in queries:
         print("\n" + "=" * 50)
-        response, references = rag_pipeline(query, faiss_index, documents, llm_model, embedding_model)
-        print("\nFinal Results:")
+        print(f"Processing query: {query}")
+        response, references = rag_pipeline(query, collection, llm_model)
+
+        print("\nFinal Results: ")
         print("-" * 30)
         print(f"Response: {response}")
-        print("Reference used:")
+        print(f"Reference used:")
+
         for ref in references:
             print(f"- {ref}")
         print("=" * 50)
 
 if __name__ == "__main__":
     main()
-
