@@ -1,7 +1,9 @@
 chromadb==1.0.13
+docx==0.2.4
 faiss_cpu==1.11.0
 numpy==2.3.1
 openai==1.91.0
 pandas==2.3.0
+PyPDF2==3.0.1
 Requests==2.32.4
 streamlit==1.46.0
